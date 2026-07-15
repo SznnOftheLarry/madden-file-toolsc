@@ -15,10 +15,21 @@ const FIELD_TYPE_SUBTABLE_COMPRESSED = 5;
 const FIELD_TYPE_FLOAT = 10;
 
 class TDB2Parser extends FileParser {
-    constructor() {
+    constructor(options = {}) {
         super();
         this.file = new TDB2File();
+        // Uncompressed TDB2 payload length from the FBCH header (offset 0x12).
+        // Used so trailing records that omit a final terminator at EOF still complete.
+        this._expectedLength = options.expectedLength || 0;
         this.bytes(0x5, this._onTableStart);
+    };
+
+    get expectedLength() {
+        return this._expectedLength;
+    };
+
+    set expectedLength(value) {
+        this._expectedLength = value;
     };
 
     _onTableStart(buf) {
@@ -130,19 +141,52 @@ class TDB2Parser extends FileParser {
         }
     };
 
+    _assignField(record, field) {
+        // CFB 27 BLOB records can repeat the same field key (e.g. two BLBM tables).
+        // Keep the first under the original name; store later copies as KEY2, KEY3, ...
+        // field.key / field.rawKey stay as in the file so writes still emit the real name.
+        for (const existingKey of Object.keys(record.fields)) {
+            if (record.fields[existingKey] === field) {
+                return existingKey;
+            }
+        }
+
+        let storageKey = field.key;
+        if (record.fields.hasOwnProperty(storageKey)) {
+            let suffix = 2;
+            while (record.fields.hasOwnProperty(field.key + suffix)) {
+                suffix++;
+            }
+            storageKey = field.key + suffix;
+        }
+        record.fields[storageKey] = field;
+        return storageKey;
+    }
+
     _onDecompressedTableFieldStart(recordParser, record, table)
     {
+        // Some BLBM/BLOB records (seen in CFB 27 and some M26-style saves) have a
+        // subrecord but no main fields after the CHVI header — only a terminator.
+        // Treat an immediate null as an empty record body instead of reading a field.
+        if (recordParser.buffer.readUInt8(recordParser.offset) === 0x0) {
+            return this._checkCompressedTableRecordEnd(record, table, recordParser);
+        }
+
         let field = new TDB2Field();
         field.rawKey = recordParser.readBytes(4);
         field.key = utilService.getUncompressedTextFromSixBitCompression(field.rawKey.slice(0, 3));
         field.type = field.rawKey.slice(3).readUInt8(0);
 
-        this._populateFieldDefinitions(table, field);
+        // Subrecord fields (M26/CFB mid-section) must not pollute the parent table's
+        // field definitions — otherwise _normalizeRecords invents stub main fields.
+        if (!record.isSubRecord) {
+            this._populateFieldDefinitions(table, field);
+        }
 
         switch (field.type) {
             case FIELD_TYPE_INT:
                 field.raw = utilService.writeModifiedLebCompressedInteger(utilService.parseModifiedLebEncodedNumber(recordParser));
-                record.fields[field.key] = field;
+                this._assignField(record, field);
 
                 // M25+ weirdness. The UNWI field is sometimes (but not always) followed by an extra zero byte.
                 // It never seems to appear at the end of a record, so checking this way shouldn't cause any issues.
@@ -151,20 +195,20 @@ class TDB2Parser extends FileParser {
                 {
                     field.raw = Buffer.concat([field.raw, recordParser.readBytes(1)]);
 
-                    record.fields[field.key] = field;
+                    this._assignField(record, field);
                 }
                 return this._checkCompressedTableRecordEnd(record, table, recordParser);
             case FIELD_TYPE_STRING:
                 const strLen = utilService.parseModifiedLebEncodedNumber(recordParser);
                 field.length = strLen;
                 field.raw = recordParser.readBytes(strLen);
-                record.fields[field.key] = field;
+                this._assignField(record, field);
                 return this._checkCompressedTableRecordEnd(record, table, recordParser);
             case FIELD_TYPE_UNK:
                 // M25+ rosters decided to be weird, sometimes they have a 0 byte after this type byte, other times they don't.
                 // This field type generally never appears at the end of a record, so checking this way shouldn't cause any issues
                 field.raw = recordParser.buffer[recordParser.offset] === 0 ? recordParser.readBytes(1) : Buffer.alloc(0);
-                record.fields[field.key] = field;
+                this._assignField(record, field);
                 return this._checkCompressedTableRecordEnd(record, table, recordParser);
             case FIELD_TYPE_SUBTABLE:
                 // Read subtable header information
@@ -180,11 +224,11 @@ class TDB2Parser extends FileParser {
 
                 // Read subtable records
                 this._readCompressedRecordSubTable(field.value, recordParser);
-                record.fields[field.key] = field;
+                this._assignField(record, field);
                 return this._checkCompressedTableRecordEnd(record, table, recordParser);
             case FIELD_TYPE_FLOAT:
                 field.raw = recordParser.readBytes(4);
-                record.fields[field.key] = field;
+                this._assignField(record, field);
                 return this._checkCompressedTableRecordEnd(record, table, recordParser);
             default:
                 console.warn(`Unsupported field type: 0x${field.type.toString(16)} at index 0x${this.currentBufferIndex.toString(16)}`);
@@ -209,17 +253,17 @@ class TDB2Parser extends FileParser {
                 switch (field.type) {
                     case FIELD_TYPE_INT:
                         field.raw = utilService.writeModifiedLebCompressedInteger(utilService.parseModifiedLebEncodedNumber(recordParser));
-                        record.fields[field.key] = field;
+                        this._assignField(record, field);
                         break;
                     case FIELD_TYPE_STRING:
                         const strLen = utilService.parseModifiedLebEncodedNumber(recordParser);
                         field.length = strLen;
                         field.raw = recordParser.readBytes(strLen);
-                        record.fields[field.key] = field;
+                        this._assignField(record, field);
                         break;
                     case FIELD_TYPE_UNK:
                         field.raw = Buffer.alloc(0);
-                        record.fields[field.key] = field;
+                        this._assignField(record, field);
                         break;
                     case FIELD_TYPE_SUBTABLE:
                         field.value = new TDB2Table();
@@ -231,12 +275,12 @@ class TDB2Parser extends FileParser {
                         field.value.numEntriesRaw = utilService.writeModifiedLebCompressedInteger(utilService.parseModifiedLebEncodedNumber(recordParser));
                         field.value.isSubTable = true;
                         field.value.parentInfo = { parentRecord: record, parentField: field, parentTable: table };
-                        record.fields[field.key] = field;
+                        this._assignField(record, field);
                         this._readCompressedRecordSubTable(field.value, recordParser);
                         break;
                     case FIELD_TYPE_FLOAT:
                         field.raw = recordParser.readBytes(4);
-                        record.fields[field.key] = field;
+                        this._assignField(record, field);
                         break;
                     default:
                         console.warn(`Unsupported field type found in subtable at index 0x${recordParser.offset.toString(16)}`);
@@ -264,6 +308,13 @@ class TDB2Parser extends FileParser {
             // If it's the end of the subrecord, we still need to read the parent record afterward
             if(record.isSubRecord)
             {
+                // CFB 27 (and some BLBM layouts) keep the no-subrecord `00 00` padding
+                // before CHVI even when mid-section/subrecord fields are present.
+                while (recordParser.offset < recordParser.buffer.length &&
+                    recordParser.buffer.readUInt8(recordParser.offset) === 0x0) {
+                    recordParser.readBytes(1);
+                }
+
                 recordParser.readBytes(4); // Read CHVI header
                 this._onDecompressedTableFieldStart(recordParser, record.parentRecord, table);
             }
@@ -315,14 +366,14 @@ class TDB2Parser extends FileParser {
                 case FIELD_TYPE_INT:
                     return this._readLebNumber(tableKeyBuf.slice(4), (fieldBuffer) => {
                         field.raw = fieldBuffer;
-                        record.fields[field.key] = field;
+                        this._assignField(record, field);
 
                         // UNWI (also the TREF field in M26) has an extra zero for some reason
                         if(field.key === 'UNWI' || field.key === 'TREF')
                         {
                             this.bytes(0x1, (buf) => {
                                 field.raw = Buffer.concat([fieldBuffer, buf]);
-                                record.fields[field.key] = field;
+                                this._assignField(record, field);
                                 this._checkTableRecordEnd(record, table);
                             });
                         }
@@ -341,7 +392,7 @@ class TDB2Parser extends FileParser {
                                     field.length = strLen;
                                     this.bytes(strLen, (strBuf) => {
                                         field.raw = strBuf;
-                                        record.fields[field.key] = field;
+                                        this._assignField(record, field);
                                         this._checkTableRecordEnd(record, table);
                                     });
                                 });
@@ -352,7 +403,7 @@ class TDB2Parser extends FileParser {
                             field.length = strLen;
                             return this.bytes(strLen, (strBuf) => {
                                 field.raw = strBuf;
-                                record.fields[field.key] = field;
+                                this._assignField(record, field);
                                 this._checkTableRecordEnd(record, table);
                             });
                         }
@@ -360,7 +411,7 @@ class TDB2Parser extends FileParser {
                     return this.bytes(0x1, (buf) => {
                        const excessBuf = Buffer.concat([tableKeyBuf.slice(4), buf]);
                        field.raw = Buffer.alloc(0);
-                       record.fields[field.key] = field;
+                       this._assignField(record, field);
                        
                        this._onTableFieldStart(record, table, excessBuf);
                     });
@@ -384,7 +435,7 @@ class TDB2Parser extends FileParser {
                                     field.value.numEntriesRaw = numEntriesBuf;
                                     field.value.isSubTable = true;
                                     field.value.parentInfo = { parentRecord: record, parentField: field, parentTable: table };
-                                    record.fields[field.key] = field;
+                                    this._assignField(record, field);
                                     this._onTableRecordStart(field.value);
                                 });
                             });
@@ -396,7 +447,7 @@ class TDB2Parser extends FileParser {
                                 field.value.numEntriesRaw = numEntriesBuf;
                                 field.value.isSubTable = true;
                                 field.value.parentInfo = { parentRecord: record, parentField: field, parentTable: table };
-                                record.fields[field.key] = field;
+                                this._assignField(record, field);
                                 
                                 this._onTableRecordStart(field.value);
                             });
@@ -406,7 +457,7 @@ class TDB2Parser extends FileParser {
                     return this.bytes(0x3, (restOfFloatBuf) => {
                         const fieldBuffer = Buffer.concat([tableKeyBuf.slice(4), restOfFloatBuf])
                         field.raw = fieldBuffer;
-                        record.fields[field.key] = field;
+                        this._assignField(record, field);
 
                         this._checkTableRecordEnd(record, table);
                     });
@@ -417,6 +468,14 @@ class TDB2Parser extends FileParser {
     };
 
     _checkTableRecordEnd(record, table) {
+        // CFB 27 roster payloads may end immediately after the last nested table
+        // without a trailing record terminator byte. Treat payload EOF as end-of-record.
+        if (this._expectedLength > 0 && this.currentBufferIndex >= this._expectedLength) {
+            this._pushTableRecord(record, table);
+            this._checkTableEnd(table);
+            return;
+        }
+
         this.bytes(0x1, (buf) => {
             if (buf.readUInt8(0) === 0x0) {
                 this._pushTableRecord(record, table);
@@ -452,7 +511,7 @@ class TDB2Parser extends FileParser {
                 const fieldDef = table.fieldDefinitions[key];
                 if (!record.fields.hasOwnProperty(fieldDef.name)) {
                     // Skip subtables as they could become a little tricky and don't really need this right now
-                    if(fieldDef.type === FIELD_TYPE_SUBTABLE)
+                    if(fieldDef.type === FIELD_TYPE_SUBTABLE || fieldDef.type === FIELD_TYPE_SUBTABLE_COMPRESSED)
                     {
                         continue;
                     }
@@ -506,8 +565,19 @@ class TDB2Parser extends FileParser {
             }
             else
             {
-                this._normalizeRecords(table);
+                // Type 3 BLOB wrappers (M26/CFB) can hold heterogeneous records
+                // (e.g. appearance BLBM vs PLAY/TEAM). Normalizing shared field
+                // defs across them invents stub fields and corrupts saves.
+                if (table.type !== 3) {
+                    this._normalizeRecords(table);
+                }
                 this.file.addTable(table);
+
+                // No more tables past the end of the uncompressed payload (CFB 27).
+                if (this._expectedLength > 0 && this.currentBufferIndex >= this._expectedLength) {
+                    return;
+                }
+
                 this.bytes(0x5, this._onTableStart);
             }
         }
