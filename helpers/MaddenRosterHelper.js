@@ -57,7 +57,8 @@ class MaddenRosterHelper {
                 let postStreamFunctions = [];
 
                 if (self._year >= 2021) {
-                    self._parser = new TDB2Parser();
+                    const expectedLength = self._headerBuffer.readUInt32LE(0x12);
+                    self._parser = new TDB2Parser({ expectedLength });
                     postStreamFunctions = [
                         zlib.createInflate(),
                         self._parser
@@ -76,6 +77,7 @@ class MaddenRosterHelper {
                     (err) => {
                         if (err) {
                             reject(err);
+                            return;
                         }
 
                         self._file = self._parser.file;
